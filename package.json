@@ -1,0 +1,25 @@
+{
+  "name": "nocode",
+  "version": "0.1.0",
+  "private": false,
+  "description": "A minimal TypeScript coding agent CLI.",
+  "type": "module",
+  "bin": {
+    "nocode": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test"
+  },
+  "dependencies": {
+    "openai": "^4.104.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
