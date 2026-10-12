@@ -6,6 +6,14 @@ import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 export type ToolResult = { ok: true; output: string } | { ok: false; error: string };
+
+/** A deterministic, structured replacement applied to one workspace file. */
+export type FilePatch = {
+  search: string;
+  replace: string;
+  /** Replace every match instead of requiring exactly one match. */
+  all?: boolean;
+};
 const failure = (error: unknown): ToolResult => ({ ok: false, error: error instanceof Error ? error.message : String(error) });
 
 export class WorkspaceTools {
@@ -75,6 +83,45 @@ export class WorkspaceTools {
       return { ok: true, output: `Wrote ${relativePath}` };
     } catch (error) { return failure(error); }
     finally { if (temporary) await fs.rm(temporary, { force: true }).catch(() => {}); }
+  }
+
+  /**
+   * Apply exact text replacements to a regular file and atomically write the result.
+   *
+   * Replacements are intentionally structured rather than shell-like patches: every
+   * search string must match, and by default it must match exactly once. This keeps
+   * edits deterministic and prevents silently changing the wrong location.
+   */
+  async applyPatch(relativePath: string, patches: FilePatch[]): Promise<ToolResult> {
+    try {
+      if (!Array.isArray(patches) || patches.length === 0) throw new Error("At least one patch is required");
+      for (const patch of patches) {
+        if (!patch || typeof patch.search !== "string" || patch.search.length === 0 || typeof patch.replace !== "string" || (patch.all !== undefined && typeof patch.all !== "boolean")) {
+          throw new Error("Each patch must include a non-empty search string and a string replacement");
+        }
+      }
+      const target = await this.resolve(relativePath);
+      const handle = await fs.open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let content: string;
+      try {
+        if (!(await handle.stat()).isFile()) throw new Error("Path must be a regular file");
+        content = await handle.readFile("utf8");
+      } finally { await handle.close(); }
+
+      for (const [index, patch] of patches.entries()) {
+        const matches = content.split(patch.search).length - 1;
+        if (matches === 0) throw new Error(`Patch ${index + 1} did not match any text`);
+        if (!patch.all && matches !== 1) throw new Error(`Patch ${index + 1} matched ${matches} locations; set all=true to replace all matches`);
+        // Use a replacer callback so `$&` and friends in user text stay literal.
+        content = patch.all ? content.split(patch.search).join(patch.replace) : content.replace(patch.search, () => patch.replace);
+      }
+      return this.writeFile(relativePath, content);
+    } catch (error) { return failure(error); }
+  }
+
+  // Alias kept for callers that prefer the noun form.
+  async patchFile(relativePath: string, patches: FilePatch[]): Promise<ToolResult> {
+    return this.applyPatch(relativePath, patches);
   }
 
   async runCommand(command: string, args: string[]): Promise<ToolResult> {
