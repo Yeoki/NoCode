@@ -89,3 +89,30 @@ test('empty response and API errors are explicit; the next turn can recover', as
   await assert.rejects(s.agent.run('Second'), /API unavailable/);
   assert.equal(await s.agent.run('Third'), 'Recovered');
 });
+
+test('accepts an injectable provider object without constructing an OpenAI client', async () => {
+  const requests = [];
+  const tools = Object.fromEntries(['listFiles', 'readFile', 'writeFile', 'applyPatch', 'runCommand'].map(name => [name, async () => ({ ok: true, output: '' })]));
+  const provider = { complete: async request => { requests.push(request); return reply('Offline response.'); } };
+  const agent = new CodingAgent(tools, async () => false, provider);
+  assert.equal(await agent.run('Use the fake provider'), 'Offline response.');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].messages[0].role, 'system');
+});
+
+test('bounds context and invokes the optional summarization hook', async () => {
+  const summaries = [];
+  const requests = [];
+  const tools = Object.fromEntries(['listFiles', 'readFile', 'writeFile', 'applyPatch', 'runCommand'].map(name => [name, async () => ({ ok: true, output: '' })]));
+  const agent = new CodingAgent(tools, async () => false, async request => {
+    requests.push(request);
+    return reply('turn complete');
+  }, { maxHistoryMessages: 6, summarizeHistory: async messages => {
+    summaries.push(messages);
+    return 'older turns summarized';
+  } });
+  for (let i = 0; i < 8; i += 1) assert.equal(await agent.run(`turn ${i}`), 'turn complete');
+  assert.ok(summaries.length > 0);
+  assert.ok(requests.every(request => request.messages.length <= 6));
+  assert.ok(requests.some(request => request.messages.some(message => message.role === 'system' && String(message.content).includes('older turns summarized'))));
+});
