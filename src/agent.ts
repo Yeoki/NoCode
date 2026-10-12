@@ -73,36 +73,59 @@ export class ConversationContext {
     return this.messages.slice();
   }
 
+  /** Find the beginning of as many complete user turns as fit in a message budget. */
+  private startForBudget(body: OpenAI.Chat.Completions.ChatCompletionMessageParam[], budget: number): number {
+    if (budget <= 0) return body.length;
+    let end = body.length;
+    let start = body.length;
+    let remaining = budget;
+    while (end > 0) {
+      let user = end - 1;
+      while (user >= 0 && body[user]?.role !== "user") user -= 1;
+      if (user < 0) break;
+      const turnLength = end - user;
+      if (turnLength <= remaining) {
+        start = user;
+        remaining -= turnLength;
+        end = user;
+        continue;
+      }
+      // A single turn can be larger than the budget. Keep its user request rather
+      // than an orphaned assistant/tool continuation.
+      if (start === body.length) start = user;
+      break;
+    }
+    return start;
+  }
+
   private async compact(): Promise<void> {
     if (this.messages.length <= this.maxMessages) return;
 
     const system = this.messages[0]?.role === "system" ? [this.messages[0]] : [];
     const body = this.messages.slice(system.length);
-    const budget = Math.max(0, this.maxMessages - system.length);
-    let cutAt = Math.max(0, body.length - budget);
-    // Never start on a tool/assistant continuation when an earlier user boundary is available.
-    while (cutAt < body.length && body[cutAt]?.role !== "user") cutAt += 1;
-    const removed = body.slice(0, cutAt);
-    if (removed.length === 0) {
-      // A single turn can contain more messages than the bound. Keep the newest bounded tail.
-      this.messages = [...system, ...body.slice(-budget)];
-      return;
-    }
-
+    const available = Math.max(0, this.maxMessages - system.length);
+    // Reserve one slot for a summary only when at least one user message can remain.
+    const summarySlot = this.summarize && available >= 2 ? 1 : 0;
+    let cutAt = this.startForBudget(body, available - summarySlot);
+    let removed = body.slice(0, cutAt);
     let summary = "";
-    if (this.summarize) {
+    if (this.summarize && summarySlot && removed.length > 0) {
       try { summary = (await this.summarize(removed)).trim(); }
       catch { summary = ""; }
     }
     const summaryMessage = summary ? [{ role: "system" as const, content: `${SUMMARY_PREFIX}${summary}` }] : [];
-    const keepBudget = Math.max(0, this.maxMessages - system.length - summaryMessage.length);
-    let kept = body.slice(cutAt);
-    if (kept.length > keepBudget) {
-      kept = keepBudget === 0 ? [] : kept.slice(-keepBudget);
-      // Prefer a user boundary when the tail still contains complete turns.
-      const firstUser = kept.findIndex((message) => message.role === "user");
-      if (firstUser > 0) kept = kept.slice(firstUser);
+    if (!summaryMessage.length) {
+      // If summarization was unavailable, retain one more complete turn.
+      cutAt = this.startForBudget(body, available);
+      removed = body.slice(0, cutAt);
     }
+    const keepBudget = Math.max(0, this.maxMessages - system.length - summaryMessage.length);
+    const nextUser = body.slice(cutAt + 1).findIndex((message) => message.role === "user");
+    const turnEnd = nextUser < 0 ? body.length : cutAt + 1 + nextUser;
+    const turnLength = Math.max(0, turnEnd - cutAt);
+    // If the current turn itself is oversized, retaining only its user request is
+    // safer than sending an assistant tool call without all of its tool results.
+    const kept = turnLength > keepBudget ? body.slice(cutAt, cutAt + Math.min(1, keepBudget)) : body.slice(cutAt, cutAt + keepBudget);
     this.messages = [...system, ...summaryMessage, ...kept];
   }
 }
