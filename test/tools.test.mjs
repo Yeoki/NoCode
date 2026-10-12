@@ -17,6 +17,23 @@ test('workspace tools can write and read a file', async () => {
   }
 });
 
+test('workspace tools apply deterministic structured patches atomically', async t => {
+  const { root, tools } = await fixture(t);
+  await fs.writeFile(path.join(root, 'patch.txt'), 'one\ntwo\ntwo\n');
+  assert.deepEqual(await tools.applyPatch('patch.txt', [{ search: 'one', replace: 'ONE' }]), { ok: true, output: 'Wrote patch.txt' });
+  assert.equal(await fs.readFile(path.join(root, 'patch.txt'), 'utf8'), 'ONE\ntwo\ntwo\n');
+  const ambiguous = await tools.applyPatch('patch.txt', [{ search: 'two', replace: 'TWO' }]);
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.error, /matched 2 locations/);
+  assert.deepEqual(await tools.applyPatch('patch.txt', [{ search: 'two', replace: 'TWO', all: true }]), { ok: true, output: 'Wrote patch.txt' });
+  assert.equal(await fs.readFile(path.join(root, 'patch.txt'), 'utf8'), 'ONE\nTWO\nTWO\n');
+  assert.deepEqual(await tools.applyPatch('patch.txt', [{ search: 'ONE', replace: '$& literal' }]), { ok: true, output: 'Wrote patch.txt' });
+  assert.match(await fs.readFile(path.join(root, 'patch.txt'), 'utf8'), /^\$& literal/);
+  const missing = await tools.applyPatch('patch.txt', [{ search: 'missing', replace: 'x' }]);
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /did not match/);
+});
+
 test('workspace tools reject paths outside the workspace', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nocode-'));
   try {
