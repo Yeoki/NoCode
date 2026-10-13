@@ -27,3 +27,10 @@ object implementing `complete(request)`. Pass `maxHistoryMessages` and
 `summarizeHistory` in the fourth constructor argument to control context
 compaction. The `apply_patch` tool uses exact string replacements and requires
 each replacement to match once unless `all: true` is specified.
+
+Pass `onEvent` (or its `onProgress` alias) in the options object to receive
+safe lifecycle updates such as `thinking`, `tool_start`, `tool_result`,
+`error`, and `final`. These events expose progress and tool metadata only; they
+never expose hidden model reasoning. The CLI renders a spinner while waiting
+for a provider and writes tool summaries to stderr so the final answer on
+stdout remains pipe-friendly.
