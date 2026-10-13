@@ -38,6 +38,22 @@ export interface ContextOptions {
   summarize?: ContextSummarizer;
 }
 
+/**
+ * User-visible lifecycle updates emitted by the agent.  These deliberately
+ * contain progress and tool metadata only; model reasoning tokens are never
+ * exposed.
+ */
+export type AgentEvent =
+  | { type: "thinking"; step: number }
+  | { type: "response"; step: number; toolCalls: number }
+  | { type: "tool_start"; step: number; id: string; name: string }
+  | { type: "tool_result"; step: number; id: string; name: string; result: ToolResult }
+  | { type: "final"; step: number; content: string }
+  | { type: "stopped"; step: number; reason: string; content: string }
+  | { type: "error"; step: number; error: string };
+
+export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
+
 const DEFAULT_MAX_MESSAGES = 40;
 const SUMMARY_PREFIX = "Previous conversation summary:\n";
 
@@ -117,7 +133,6 @@ export class ConversationContext {
     if (!summaryMessage.length) {
       // If summarization was unavailable, retain one more complete turn.
       cutAt = this.startForBudget(body, available);
-      removed = body.slice(0, cutAt);
     }
     const keepBudget = Math.max(0, this.maxMessages - system.length - summaryMessage.length);
     const nextUser = body.slice(cutAt + 1).findIndex((message) => message.role === "user");
@@ -136,6 +151,10 @@ export interface CodingAgentOptions extends ContextOptions {
   /** Alias for ContextOptions.summarize. */
   summarizeHistory?: ContextSummarizer;
   model?: string;
+  /** Called for safe, user-visible progress updates (never hidden reasoning). */
+  onEvent?: AgentEventHandler;
+  /** Alias retained for consumers that call these progress callbacks. */
+  onProgress?: AgentEventHandler;
 }
 
 const schemas = {
@@ -165,6 +184,7 @@ export class CodingAgent {
   private readonly complete: CompletionProvider;
   private readonly model: string;
   private readonly context: ConversationContext;
+  private readonly onEvent?: AgentEventHandler;
 
   constructor(
     private readonly tools: WorkspaceTools,
@@ -185,28 +205,77 @@ export class CodingAgent {
       maxMessages: options.maxHistoryMessages ?? options.maxMessages,
       summarize: options.summarizeHistory ?? options.summarize
     });
+    this.onEvent = options.onEvent ?? options.onProgress;
+  }
+
+  /** Event handlers are advisory. A broken status renderer must never stop the agent. */
+  private async emit(event: AgentEvent): Promise<void> {
+    if (!this.onEvent) return;
+    try { await this.onEvent(event); } catch { /* progress output is best effort */ }
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   async run(userInput: string): Promise<string> {
     this.context.add({ role: "user", content: userInput });
     for (let step = 0; step < 8; step += 1) {
-      const completion = await this.complete({ model: this.model, messages: await this.context.getMessages(), tools: toolDefinitions, tool_choice: "auto" });
+      await this.emit({ type: "thinking", step: step + 1 });
+      let completion: ChatCompletionResponse;
+      try {
+        completion = await this.complete({ model: this.model, messages: await this.context.getMessages(), tools: toolDefinitions, tool_choice: "auto" });
+      } catch (error) {
+        const message = this.errorMessage(error);
+        await this.emit({ type: "error", step: step + 1, error: message });
+        throw error;
+      }
+      if (!completion || !Array.isArray(completion.choices)) {
+        const error = new Error("Provider returned an invalid completion response.");
+        await this.emit({ type: "error", step: step + 1, error: error.message });
+        throw error;
+      }
       const message = completion.choices[0]?.message;
-      if (!message) return "No response from model.";
+      if (!message) {
+        const result = "No response from model.";
+        await this.emit({ type: "response", step: step + 1, toolCalls: 0 });
+        await this.emit({ type: "final", step: step + 1, content: result });
+        return result;
+      }
       this.context.add(message);
-      if (!message.tool_calls?.length) return message.content ?? "(empty response)";
-      for (const call of message.tool_calls) {
+      const calls = message.tool_calls ?? [];
+      const toolCalls = calls.length;
+      await this.emit({ type: "response", step: step + 1, toolCalls });
+      if (!toolCalls) {
+        // Some providers return an empty string when they finish successfully.
+        // Keep the CLI from looking like it silently stopped in that case.
+        const result = typeof message.content === "string" && message.content.trim()
+          ? message.content
+          : "(empty response)";
+        await this.emit({ type: "final", step: step + 1, content: result });
+        return result;
+      }
+      for (const [callIndex, call] of calls.entries()) {
+        // Be defensive around alternate providers that return a malformed tool
+        // call: turn it into a normal tool error so the model can recover.
+        const callId = typeof call?.id === "string" && call.id ? call.id : `tool-${step + 1}-${callIndex + 1}`;
+        const callName = typeof call?.function?.name === "string" && call.function.name ? call.function.name : "(unknown)";
+        await this.emit({ type: "tool_start", step: step + 1, id: callId, name: callName });
         let result: ToolResult;
         try {
-          const args: unknown = JSON.parse(call.function.arguments);
-          result = await this.execute(call.function.name, args);
+          const args: unknown = JSON.parse(call?.function?.arguments ?? "");
+          result = await this.execute(callName, args);
         } catch (error) {
-          result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+          result = { ok: false, error: this.errorMessage(error) };
         }
-        this.context.add({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.emit({ type: "tool_result", step: step + 1, id: callId, name: callName, result });
+        this.context.add({ role: "tool", tool_call_id: callId, content: JSON.stringify(result) });
       }
     }
-    return "Stopped after the maximum tool steps.";
+    const result = "Stopped after the maximum tool steps.";
+    await this.emit({ type: "stopped", step: 8, reason: "maximum tool steps", content: result });
+    await this.emit({ type: "final", step: 8, content: result });
+    return result;
   }
 
   private async execute(name: string, raw: unknown): Promise<ToolResult> {
