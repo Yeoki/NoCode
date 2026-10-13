@@ -107,11 +107,21 @@ test('invalid roots and non-file targets return structured failures', async t =>
 
 test('command execution uses literal argv, workspace cwd and structured failures', async t => {
   const { root, tools } = await fixture(t);
+  const previousOpenAiKey = process.env.OPENAI_API_KEY;
+  const previousCodexKey = process.env.CODEX_API_KEY;
+  process.env.OPENAI_API_KEY = 'test-secret-openai-key';
+  process.env.CODEX_API_KEY = 'test-secret-codex-key';
+  t.after(() => {
+    if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    if (previousCodexKey === undefined) delete process.env.CODEX_API_KEY; else process.env.CODEX_API_KEY = previousCodexKey;
+  });
   const result = await tools.runCommand(process.execPath, ['-e', 'console.log(process.cwd()); console.log(process.argv[1]); console.error("stderr")', 'a; echo injected']);
   assert.equal(result.ok, true);
   assert.match(result.output, new RegExp(root));
   assert.match(result.output, /a; echo injected/);
   assert.match(result.output, /stderr/);
+  const secrets = await tools.runCommand(process.execPath, ['-e', 'console.log(process.env.OPENAI_API_KEY ?? "missing"); console.log(process.env.CODEX_API_KEY ?? "missing")']);
+  assert.deepEqual(secrets, { ok: true, output: 'missing\nmissing\n' });
   const failed = await tools.runCommand(process.execPath, ['-e', 'console.error("failure detail"); process.exit(3)']);
   assert.equal(failed.ok, false); assert.match(failed.error, /failure detail/);
   assert.equal((await tools.runCommand('', [])).ok, false);

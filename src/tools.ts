@@ -127,7 +127,8 @@ export class WorkspaceTools {
   async runCommand(command: string, args: string[]): Promise<ToolResult> {
     try {
       if (typeof command !== "string" || !command.trim() || command.includes("\0") || !Array.isArray(args) || args.some(a => typeof a !== "string" || a.includes("\0"))) throw new Error("Invalid command arguments");
-      const { stdout, stderr } = await execFileAsync(command, args, { cwd: await this.resolve("."), timeout: 30_000, maxBuffer: 1_000_000 });
+      const { OPENAI_API_KEY: _openAiApiKey, CODEX_API_KEY: _codexApiKey, ...commandEnvironment } = process.env;
+      const { stdout, stderr } = await execFileAsync(command, args, { cwd: await this.resolve("."), env: commandEnvironment, timeout: 30_000, maxBuffer: 1_000_000 });
       return { ok: true, output: [stdout, stderr].filter(Boolean).join("\n") || "(no output)" };
     } catch (error) {
       const e = error as { message?: string; stdout?: string; stderr?: string };
