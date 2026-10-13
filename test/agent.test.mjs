@@ -32,6 +32,118 @@ test('mocked loop sends tool results and retains conversation across turns', asy
   assert.deepEqual(s.prompts, []);
 });
 
+test('Responses API loop sends function_call_output and preserves tool history', async () => {
+  const requests = [], invocations = [];
+  const tools = {
+    listFiles: async (...args) => {
+      invocations.push(args);
+      return { ok: true, output: 'tool output' };
+    },
+    readFile: async () => ({ ok: true, output: '' }),
+    writeFile: async () => ({ ok: true, output: '' }),
+    runCommand: async () => ({ ok: true, output: '' })
+  };
+  const responses = [
+    { output: [{ type: 'function_call', id: 'fc-1', call_id: 'call-1', name: 'list_files', arguments: '{}' }], output_text: '' },
+    { output: [], output_text: 'Listed.' }
+  ];
+  const agent = new CodingAgent(tools, async () => false, undefined, async request => {
+    requests.push(structuredClone(request));
+    return responses.shift();
+  });
+
+  assert.equal(await agent.run('Inspect'), 'Listed.');
+  assert.deepEqual(invocations, [['.']]);
+  assert.equal(requests[0].tools[0].type, 'function');
+  assert.equal(requests[0].tools[0].name, 'list_files');
+  assert.deepEqual(requests[1].input.at(-1), {
+    type: 'function_call_output',
+    call_id: 'call-1',
+    output: JSON.stringify({ ok: true, output: 'tool output' })
+  });
+});
+
+const responseReply = text => ({
+  output: [{ type: 'message', id: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] }],
+  output_text: text
+});
+
+function setupResponses(responses, options = {}) {
+  const requests = [], invocations = [];
+  const tools = {
+    listFiles: async (...args) => {
+      invocations.push(args);
+      return { ok: true, output: 'tool output' };
+    }
+  };
+  const agent = new CodingAgent(tools, async () => false, undefined, {
+    ...options,
+    completeResponses: async request => {
+      requests.push(structuredClone(request));
+      const response = responses.shift();
+      assert.ok(response, 'Unexpected Responses request');
+      return response;
+    }
+  });
+  return { agent, requests, invocations };
+}
+
+test('Responses bounds old turns and passes text history to the summarization hook', async () => {
+  const summaries = [];
+  const s = setupResponses(Array.from({ length: 12 }, () => responseReply('turn complete')), {
+    model: 'offline-responses-model',
+    maxHistoryMessages: 4,
+    summarizeHistory: messages => { summaries.push(messages); return 'older turns summarized'; }
+  });
+  for (let i = 0; i < 12; i += 1) assert.equal(await s.agent.run(`turn ${i}`), 'turn complete');
+  assert.ok(s.requests.every(request => request.model === 'offline-responses-model' && request.input.length + 1 <= 4));
+  assert.equal(s.requests.at(-1).input.at(-1).content, 'turn 11');
+  assert.ok(summaries.some(messages => messages.some(message => message.role === 'user' && message.content === 'turn 0')));
+  assert.ok(summaries.some(messages => messages.some(message => message.role === 'assistant' && message.content === 'turn complete')));
+  assert.ok(s.requests.some(request => request.input.some(item => item.role === 'system' && item.content.includes('older turns summarized'))));
+});
+
+test('Responses compaction keeps reasoning and parallel function calls with every result', async () => {
+  const reasoning = { type: 'reasoning', id: 'reasoning', summary: [], encrypted_content: 'opaque-fixture' };
+  const calls = ['first', 'second'].map(id => ({ type: 'function_call', id: `fc-${id}`, call_id: id, name: 'list_files', arguments: '{}' }));
+  const s = setupResponses([responseReply('Earlier answer'), { output: [reasoning, ...calls], output_text: '' }, responseReply('Done')], {
+    maxHistoryMessages: 8,
+    summarizeHistory: () => 'Earlier turn'
+  });
+  await s.agent.run('Earlier request');
+  assert.equal(await s.agent.run('Inspect'), 'Done');
+  const input = s.requests[2].input;
+  assert.equal(input.length + 1, 8);
+  assert.equal(input[1].content, 'Inspect');
+  assert.deepEqual(input.slice(2, 5), [reasoning, ...calls]);
+  assert.deepEqual(input.slice(5).map(item => item.call_id), ['first', 'second']);
+  assert.ok(input.slice(5).every(item => item.type === 'function_call_output' && JSON.parse(item.output).ok));
+  assert.equal(s.invocations.length, 2);
+});
+
+test('Responses preserves an oversized current tool turn and evicts it on the next user turn', async () => {
+  const reasoning = { type: 'reasoning', id: 'reasoning', summary: [] };
+  const toolCall = { type: 'function_call', id: 'fc-1', call_id: 'call-1', name: 'list_files', arguments: '{}' };
+  const s = setupResponses([{ output: [reasoning, toolCall], output_text: '' }, responseReply('Done'), responseReply('Next answer')], { maxHistoryMessages: 4 });
+  assert.equal(await s.agent.run('Inspect'), 'Done');
+  assert.deepEqual(s.requests[1].input.slice(1, 3), [reasoning, toolCall]);
+  assert.equal(s.requests[1].input.at(-1).call_id, 'call-1');
+  assert.equal(s.requests[1].input[0].content, 'Inspect');
+  assert.equal(await s.agent.run('Next'), 'Next answer');
+  assert.deepEqual(s.requests[2].input, [{ role: 'user', content: 'Next' }]);
+  assert.equal(s.invocations.length, 1);
+});
+
+test('Responses falls back to recent complete turns when summarization fails or is empty', async () => {
+  for (const summarizeHistory of [() => '', () => { throw new Error('Summary unavailable'); }]) {
+    const s = setupResponses(Array.from({ length: 8 }, () => responseReply('Done')), { maxHistoryMessages: 4, summarizeHistory });
+    for (let i = 0; i < 8; i += 1) assert.equal(await s.agent.run(`turn ${i}`), 'Done');
+    assert.ok(s.requests.every(request => request.input.length + 1 <= 4));
+    assert.equal(s.requests.at(-1).input.at(-1).content, 'turn 7');
+    assert.ok(s.requests.every(request => request.input[0].role === 'user'));
+  }
+});
+
 test('invalid JSON, null, wrong types, missing/extra fields and unknown tools return errors', async () => {
   const cases = [
     ['read_file', '{'], ['read_file', null], ['read_file', {}], ['read_file', { path: 7 }],

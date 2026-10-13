@@ -12,13 +12,14 @@ export interface ChatCompletionProvider {
 
 /** Function form retained for backwards compatibility with the original MVP. */
 export type CompletionProvider = (request: ChatCompletionRequest) => Promise<ChatCompletionResponse>;
+export type ResponsesProvider = (request: OpenAI.Responses.ResponseCreateParamsNonStreaming) => Promise<OpenAI.Responses.Response>;
 
 /** Thin adapter around the official OpenAI client. No client is constructed by tests that inject a provider. */
 export class OpenAICompletionProvider implements ChatCompletionProvider {
   private readonly client: OpenAI;
 
   constructor(client?: OpenAI) {
-    this.client = client ?? new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    this.client = client ?? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL });
   }
 
   complete(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
@@ -32,14 +33,14 @@ export { OpenAICompletionProvider as OpenAIProvider };
 export type ContextSummarizer = (messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]) => Promise<string> | string;
 
 export interface ContextOptions {
-  /** Maximum number of messages sent to the provider, including the system prompt. */
+  /** Message/item budget including system instructions. An oversized Responses turn stays intact. */
   maxMessages?: number;
   /** Optional hook used to preserve a compact summary when old messages are removed. */
   summarize?: ContextSummarizer;
 }
 
 /**
- * User-visible lifecycle updates emitted by the agent.  These deliberately
+ * User-visible lifecycle updates emitted by the agent. These deliberately
  * contain progress and tool metadata only; model reasoning tokens are never
  * exposed.
  */
@@ -56,6 +57,29 @@ export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 
 const DEFAULT_MAX_MESSAGES = 40;
 const SUMMARY_PREFIX = "Previous conversation summary:\n";
+
+/** Find the beginning of as many complete user turns as fit in a message budget. */
+function startForTurnBudget<T>(body: T[], budget: number, isUser: (message: T) => boolean): number {
+  if (budget <= 0) return body.length;
+  let end = body.length;
+  let start = body.length;
+  let remaining = budget;
+  while (end > 0) {
+    let user = end - 1;
+    while (user >= 0 && !isUser(body[user]!)) user -= 1;
+    if (user < 0) break;
+    const turnLength = end - user;
+    if (turnLength <= remaining) {
+      start = user;
+      remaining -= turnLength;
+      end = user;
+      continue;
+    }
+    if (start === body.length) start = user;
+    break;
+  }
+  return start;
+}
 
 /**
  * Maintains a bounded conversation while preserving the system prompt and recent turns.
@@ -89,31 +113,6 @@ export class ConversationContext {
     return this.messages.slice();
   }
 
-  /** Find the beginning of as many complete user turns as fit in a message budget. */
-  private startForBudget(body: OpenAI.Chat.Completions.ChatCompletionMessageParam[], budget: number): number {
-    if (budget <= 0) return body.length;
-    let end = body.length;
-    let start = body.length;
-    let remaining = budget;
-    while (end > 0) {
-      let user = end - 1;
-      while (user >= 0 && body[user]?.role !== "user") user -= 1;
-      if (user < 0) break;
-      const turnLength = end - user;
-      if (turnLength <= remaining) {
-        start = user;
-        remaining -= turnLength;
-        end = user;
-        continue;
-      }
-      // A single turn can be larger than the budget. Keep its user request rather
-      // than an orphaned assistant/tool continuation.
-      if (start === body.length) start = user;
-      break;
-    }
-    return start;
-  }
-
   private async compact(): Promise<void> {
     if (this.messages.length <= this.maxMessages) return;
 
@@ -122,7 +121,7 @@ export class ConversationContext {
     const available = Math.max(0, this.maxMessages - system.length);
     // Reserve one slot for a summary only when at least one user message can remain.
     const summarySlot = this.summarize && available >= 2 ? 1 : 0;
-    let cutAt = this.startForBudget(body, available - summarySlot);
+    let cutAt = startForTurnBudget(body, available - summarySlot, message => message.role === "user");
     let removed = body.slice(0, cutAt);
     let summary = "";
     if (this.summarize && summarySlot && removed.length > 0) {
@@ -132,7 +131,8 @@ export class ConversationContext {
     const summaryMessage = summary ? [{ role: "system" as const, content: `${SUMMARY_PREFIX}${summary}` }] : [];
     if (!summaryMessage.length) {
       // If summarization was unavailable, retain one more complete turn.
-      cutAt = this.startForBudget(body, available);
+      cutAt = startForTurnBudget(body, available, message => message.role === "user");
+      removed = body.slice(0, cutAt);
     }
     const keepBudget = Math.max(0, this.maxMessages - system.length - summaryMessage.length);
     const nextUser = body.slice(cutAt + 1).findIndex((message) => message.role === "user");
@@ -142,6 +142,57 @@ export class ConversationContext {
     // safer than sending an assistant tool call without all of its tool results.
     const kept = turnLength > keepBudget ? body.slice(cutAt, cutAt + Math.min(1, keepBudget)) : body.slice(cutAt, cutAt + keepBudget);
     this.messages = [...system, ...summaryMessage, ...kept];
+  }
+}
+
+/** Project removed Responses items to text messages for the existing summarizer API. */
+function responseSummaryMessages(items: OpenAI.Responses.ResponseInput): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  return items.map(item => {
+    if ("role" in item && "content" in item) {
+      const content = typeof item.content === "string" ? item.content : item.content.map(part => "text" in part ? part.text : JSON.stringify(part)).join("\n");
+      return { role: item.role, content };
+    }
+    // Opaque reasoning state is replayed in retained turns, but is not useful to a text summarizer.
+    const content = item.type === "reasoning" ? JSON.stringify({ type: item.type, summary: item.summary }) : JSON.stringify(item);
+    return { role: "assistant", content };
+  });
+}
+
+class ResponsesConversationContext {
+  private items: OpenAI.Responses.ResponseInput = [];
+  private readonly maxMessages: number;
+  private readonly summarize?: ContextSummarizer;
+
+  constructor(options: ContextOptions = {}) {
+    this.maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
+    if (!Number.isInteger(this.maxMessages) || this.maxMessages < 2) throw new Error("maxMessages must be an integer of at least 2");
+    this.summarize = options.summarize;
+  }
+
+  add(...items: OpenAI.Responses.ResponseInput): void {
+    this.items.push(...items);
+  }
+
+  async getMessages(): Promise<OpenAI.Responses.ResponseInput> {
+    // The separate instructions field counts as one message, like the Chat system prompt.
+    const available = this.maxMessages - 1;
+    if (this.items.length > available) {
+      const isUser = (item: OpenAI.Responses.ResponseInputItem): boolean => "role" in item && item.role === "user";
+      let latestUser = this.items.length - 1;
+      while (latestUser > 0 && !isUser(this.items[latestUser]!)) latestUser -= 1;
+      const summarySlot = this.summarize && this.items.length - latestUser < available ? 1 : 0;
+      let cutAt = startForTurnBudget(this.items, available - summarySlot, isUser);
+      let summary = "";
+      if (this.summarize && summarySlot && cutAt > 0) {
+        try { summary = (await this.summarize(responseSummaryMessages(this.items.slice(0, cutAt)))).trim(); }
+        catch { summary = ""; }
+      }
+      if (!summary) cutAt = startForTurnBudget(this.items, available, isUser);
+      const summaryMessage = summary ? [{ role: "system" as const, content: `${SUMMARY_PREFIX}${summary}` }] : [];
+      // Keep the entire current turn even if oversized: reasoning, calls and outputs must stay together.
+      this.items = [...summaryMessage, ...this.items.slice(cutAt)];
+    }
+    return this.items.slice();
   }
 }
 
@@ -155,6 +206,8 @@ export interface CodingAgentOptions extends ContextOptions {
   onEvent?: AgentEventHandler;
   /** Alias retained for consumers that call these progress callbacks. */
   onProgress?: AgentEventHandler;
+  /** Optional Responses API provider, also accepted directly as the fourth constructor argument. */
+  completeResponses?: ResponsesProvider;
 }
 
 const schemas = {
@@ -180,31 +233,49 @@ const SYSTEM_PROMPT = "You are NoCode, a careful coding agent. Work only in the 
 
 type ProviderInput = CompletionProvider | ChatCompletionProvider;
 
+const responseToolDefinitions: OpenAI.Responses.Tool[] = toolDefinitions.map(({ function: definition }) => ({
+  type: "function",
+  name: definition.name,
+  description: definition.description,
+  parameters: definition.parameters,
+  // These schemas intentionally include optional fields, so strict mode is not used here.
+  strict: false
+}));
+
 export class CodingAgent {
   private readonly complete: CompletionProvider;
+  private readonly completeResponses: ResponsesProvider;
   private readonly model: string;
   private readonly context: ConversationContext;
+  private readonly responseContext: ResponsesConversationContext;
+  private readonly useResponses: boolean;
   private readonly onEvent?: AgentEventHandler;
 
   constructor(
     private readonly tools: WorkspaceTools,
     private readonly confirm: (prompt: string) => Promise<boolean>,
     provider?: ProviderInput,
-    options: CodingAgentOptions = {}
+    optionsOrResponses: CodingAgentOptions | ResponsesProvider = {}
   ) {
+    const options = typeof optionsOrResponses === "function" ? { completeResponses: optionsOrResponses } : optionsOrResponses;
+    let client: OpenAI | undefined;
+    const getClient = (): OpenAI => client ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL });
     if (!provider) {
-      const adapter = new OpenAICompletionProvider();
-      this.complete = adapter.complete.bind(adapter);
+      this.complete = request => getClient().chat.completions.create(request);
     } else if (typeof provider === "function") {
       this.complete = provider;
     } else {
       this.complete = provider.complete.bind(provider);
     }
+    this.completeResponses = options.completeResponses ?? (request => getClient().responses.create(request));
     this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
-    this.context = new ConversationContext(SYSTEM_PROMPT, {
+    this.useResponses = Boolean(options.completeResponses) || (!provider && process.env.OPENAI_WIRE_API?.toLowerCase() === "responses");
+    const contextOptions = {
       maxMessages: options.maxHistoryMessages ?? options.maxMessages,
       summarize: options.summarizeHistory ?? options.summarize
-    });
+    };
+    this.context = new ConversationContext(SYSTEM_PROMPT, contextOptions);
+    this.responseContext = new ResponsesConversationContext(contextOptions);
     this.onEvent = options.onEvent ?? options.onProgress;
   }
 
@@ -219,6 +290,11 @@ export class CodingAgent {
   }
 
   async run(userInput: string): Promise<string> {
+    if (this.useResponses) return this.runResponses(userInput);
+    return this.runChat(userInput);
+  }
+
+  private async runChat(userInput: string): Promise<string> {
     this.context.add({ role: "user", content: userInput });
     for (let step = 0; step < 8; step += 1) {
       await this.emit({ type: "thinking", step: step + 1 });
@@ -244,11 +320,8 @@ export class CodingAgent {
       }
       this.context.add(message);
       const calls = message.tool_calls ?? [];
-      const toolCalls = calls.length;
-      await this.emit({ type: "response", step: step + 1, toolCalls });
-      if (!toolCalls) {
-        // Some providers return an empty string when they finish successfully.
-        // Keep the CLI from looking like it silently stopped in that case.
+      await this.emit({ type: "response", step: step + 1, toolCalls: calls.length });
+      if (!calls.length) {
         const result = typeof message.content === "string" && message.content.trim()
           ? message.content
           : "(empty response)";
@@ -256,8 +329,6 @@ export class CodingAgent {
         return result;
       }
       for (const [callIndex, call] of calls.entries()) {
-        // Be defensive around alternate providers that return a malformed tool
-        // call: turn it into a normal tool error so the model can recover.
         const callId = typeof call?.id === "string" && call.id ? call.id : `tool-${step + 1}-${callIndex + 1}`;
         const callName = typeof call?.function?.name === "string" && call.function.name ? call.function.name : "(unknown)";
         await this.emit({ type: "tool_start", step: step + 1, id: callId, name: callName });
@@ -270,6 +341,58 @@ export class CodingAgent {
         }
         await this.emit({ type: "tool_result", step: step + 1, id: callId, name: callName, result });
         this.context.add({ role: "tool", tool_call_id: callId, content: JSON.stringify(result) });
+      }
+    }
+    const result = "Stopped after the maximum tool steps.";
+    await this.emit({ type: "stopped", step: 8, reason: "maximum tool steps", content: result });
+    await this.emit({ type: "final", step: 8, content: result });
+    return result;
+  }
+
+  private async runResponses(userInput: string): Promise<string> {
+    this.responseContext.add({ role: "user", content: userInput });
+    for (let step = 0; step < 8; step += 1) {
+      await this.emit({ type: "thinking", step: step + 1 });
+      let response: OpenAI.Responses.Response;
+      try {
+        response = await this.completeResponses({
+          model: this.model,
+          instructions: SYSTEM_PROMPT,
+          input: await this.responseContext.getMessages(),
+          tools: responseToolDefinitions
+        });
+      } catch (error) {
+        const message = this.errorMessage(error);
+        await this.emit({ type: "error", step: step + 1, error: message });
+        throw error;
+      }
+      if (!response || !Array.isArray(response.output)) {
+        const error = new Error("Provider returned an invalid Responses response.");
+        await this.emit({ type: "error", step: step + 1, error: error.message });
+        throw error;
+      }
+      // Reasoning and assistant output items must be preserved before tool outputs.
+      this.responseContext.add(...(response.output as OpenAI.Responses.ResponseInputItem[]));
+      const calls = response.output.filter((item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call");
+      await this.emit({ type: "response", step: step + 1, toolCalls: calls.length });
+      if (!calls.length) {
+        const result = response.output_text || "(empty response)";
+        await this.emit({ type: "final", step: step + 1, content: result });
+        return result;
+      }
+      for (const [callIndex, call] of calls.entries()) {
+        const callId = typeof call.call_id === "string" && call.call_id ? call.call_id : `tool-${step + 1}-${callIndex + 1}`;
+        const callName = typeof call.name === "string" && call.name ? call.name : "(unknown)";
+        await this.emit({ type: "tool_start", step: step + 1, id: callId, name: callName });
+        let result: ToolResult;
+        try {
+          const args: unknown = JSON.parse(call.arguments);
+          result = await this.execute(callName, args);
+        } catch (error) {
+          result = { ok: false, error: this.errorMessage(error) };
+        }
+        await this.emit({ type: "tool_result", step: step + 1, id: callId, name: callName, result });
+        this.responseContext.add({ type: "function_call_output", call_id: callId, output: JSON.stringify(result) });
       }
     }
     const result = "Stopped after the maximum tool steps.";
