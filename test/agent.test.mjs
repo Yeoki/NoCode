@@ -90,6 +90,38 @@ test('empty response and API errors are explicit; the next turn can recover', as
   assert.equal(await s.agent.run('Third'), 'Recovered');
 });
 
+test('blank provider content is visible instead of looking like no response', async () => {
+  for (const content of ['', '   ']) {
+    const s = setup([reply(content)]);
+    assert.equal(await s.agent.run('Say something'), '(empty response)');
+  }
+});
+
+test('progress callback reports thinking, tools, results and final answer', async () => {
+  const events = [];
+  const s = setup([reply(null, [call('list_files', {})]), reply('Done')]);
+  const agent = new CodingAgent(s.tools, async () => false, async request => {
+    const response = s.requests.length === 0 ? reply(null, [call('list_files', {})]) : reply('Done');
+    s.requests.push(structuredClone(request));
+    return response;
+  }, { onEvent: event => events.push(event) });
+  assert.equal(await agent.run('Inspect'), 'Done');
+  assert.deepEqual(events.map(event => event.type), [
+    'thinking', 'response', 'tool_start', 'tool_result', 'thinking', 'response', 'final'
+  ]);
+  assert.equal(events.find(event => event.type === 'tool_start').name, 'list_files');
+  assert.equal(events.find(event => event.type === 'tool_result').result.ok, true);
+  assert.equal(events.at(-1).content, 'Done');
+});
+
+test('provider failures are surfaced to progress callbacks and callers', async () => {
+  const events = [];
+  const agent = new CodingAgent({}, async () => false, async () => { throw new Error('offline'); }, { onProgress: event => events.push(event) });
+  await assert.rejects(agent.run('Go'), /offline/);
+  assert.deepEqual(events.map(event => event.type), ['thinking', 'error']);
+  assert.equal(events.at(-1).error, 'offline');
+});
+
 test('accepts an injectable provider object without constructing an OpenAI client', async () => {
   const requests = [];
   const tools = Object.fromEntries(['listFiles', 'readFile', 'writeFile', 'applyPatch', 'runCommand'].map(name => [name, async () => ({ ok: true, output: '' })]));
