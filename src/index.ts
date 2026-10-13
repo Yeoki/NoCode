@@ -33,7 +33,11 @@ function createProgressRenderer(): (event: AgentEvent) => void {
     spinner = setInterval(draw, 250);
   };
   const summarize = (event: Extract<AgentEvent, { type: "tool_result" }>): string => {
-    if (!event.result.ok) return `error: ${event.result.error}`;
+    const clean = (value: string): string => value.replace(/[\u0000-\u001f\u007f\u001b]/g, " ").trim();
+    if (!event.result.ok) {
+      const error = clean(event.result.error);
+      return `error: ${error.length > 120 ? `${error.slice(0, 117)}...` : error}`;
+    }
     // Tool output can contain arbitrary bytes; do not let it inject terminal
     // control sequences into the progress renderer.
     const firstLine = (event.result.output.split(/\r?\n/, 1)[0] ?? "")
