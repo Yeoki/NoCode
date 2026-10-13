@@ -41,3 +41,32 @@ safe lifecycle updates such as `thinking`, `tool_start`, `tool_result`,
 never expose hidden model reasoning. The CLI renders a spinner while waiting
 for a provider and writes tool summaries to stderr so the final answer on
 stdout remains pipe-friendly.
+
+When Codex is logged in with an API key on the same computer, the local bridge can reuse that key without copying it into this repository:
+
+```bash
+npm run dev:codex -- /path/to/workspace
+```
+
+The normal `dev:codex` path reuses only the key. To also reuse the endpoint, protocol, and model from Codex's user configuration, explicitly opt in:
+
+```bash
+NOCODE_REUSE_CODEX_ENDPOINT=1 npm run dev:codex -- /path/to/workspace
+```
+
+This is intended for a trusted custom endpoint configured in Codex. The endpoint may receive the same API key, so review the `base_url` before enabling it.
+
+Endpoint reuse reads `${CODEX_HOME:-~/.codex}/config.toml` and selects the custom
+provider named by its top-level `model_provider`. With the built-in `openai` provider,
+it uses `openai_base_url` or the standard OpenAI endpoint. Explicit `OPENAI_BASE_URL`,
+`OPENAI_WIRE_API`, and `OPENAI_MODEL` values take precedence. This bridge reads only
+that user configuration file; it does not resolve Codex CLI overrides or profile files.
+
+For the compiled CLI:
+
+```bash
+npm run build
+npm run start:codex -- /path/to/workspace
+```
+
+The bridge prefers an existing `OPENAI_API_KEY`. If it is absent, it reads `OPENAI_API_KEY` from `${CODEX_HOME:-~/.codex}/auth.json` only when Codex is using API-key authentication. It never writes the key to the project or prints it. A normal Platform API key exported as `OPENAI_API_KEY` remains the portable configuration.

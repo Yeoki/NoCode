@@ -77,7 +77,7 @@ function createProgressRenderer(): (event: AgentEvent) => void {
 
 async function main(): Promise<void> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
-    console.log("Usage: nocode [workspace]\nSet OPENAI_API_KEY and optionally OPENAI_MODEL. File writes and commands require confirmation.");
+    console.log("Usage: nocode [workspace]\nSet OPENAI_API_KEY, or run via npm run dev:codex to reuse Codex's local API-key login. Optionally set OPENAI_MODEL. File writes and commands require confirmation.");
     return;
   }
   const workspace = await fs.realpath(path.resolve(process.argv[2] ?? process.cwd()));
