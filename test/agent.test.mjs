@@ -92,6 +92,15 @@ test('Responses API converts incomplete function calls into structured tool erro
   });
 });
 
+test('Responses API makes blank provider content visible instead of looking like no response', async () => {
+  for (const output_text of ['', '   ', '\n\t']) {
+    const agent = new CodingAgent({ listFiles: async () => ({ ok: true, output: '' }) }, async () => false, undefined, {
+      completeResponses: async () => ({ output: [], output_text })
+    });
+    assert.equal(await agent.run('Say something'), '(empty response)');
+  }
+});
+
 const responseReply = text => ({
   output: [{ type: 'message', id: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] }],
   output_text: text
