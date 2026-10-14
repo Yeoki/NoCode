@@ -85,10 +85,14 @@ test('Responses API converts incomplete function calls into structured tool erro
     completeResponses: async request => { requests.push(structuredClone(request)); return responses.shift(); }
   });
   assert.equal(await agent.run('Inspect'), 'Recovered.');
+  assert.deepEqual(requests[1].input.slice(0, 2), [
+    { role: 'user', content: 'Inspect' },
+    { type: 'function_call', id: 'fc-1', call_id: 'tool-1-1', name: 'list_files', arguments: 'null' }
+  ]);
   assert.deepEqual(requests[1].input.at(-1), {
     type: 'function_call_output',
     call_id: 'tool-1-1',
-    output: JSON.stringify({ ok: false, error: '"undefined" is not valid JSON' })
+    output: JSON.stringify({ ok: false, error: 'Invalid arguments for list_files: [\n  {\n    "code": "invalid_type",\n    "expected": "object",\n    "received": "null",\n    "path": [],\n    "message": "Expected object, received null"\n  }\n]' })
   });
 });
 
