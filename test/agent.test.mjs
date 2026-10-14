@@ -63,6 +63,35 @@ test('Responses API loop sends function_call_output and preserves tool history',
   });
 });
 
+test('Responses API surfaces malformed provider output through the error event', async () => {
+  const events = [];
+  const tools = { listFiles: async () => ({ ok: true, output: '' }) };
+  const agent = new CodingAgent(tools, async () => false, undefined, {
+    onEvent: event => events.push(event),
+    completeResponses: async () => ({ output: [null], output_text: '' })
+  });
+  await assert.rejects(agent.run('Inspect'), /invalid Responses output item/);
+  assert.deepEqual(events.map(event => event.type), ['thinking', 'error']);
+});
+
+test('Responses API converts incomplete function calls into structured tool errors', async () => {
+  const requests = [];
+  const tools = { listFiles: async () => ({ ok: true, output: '' }) };
+  const responses = [
+    { output: [{ type: 'function_call', id: 'fc-1', name: 'list_files' }], output_text: '' },
+    { output: [], output_text: 'Recovered.' }
+  ];
+  const agent = new CodingAgent(tools, async () => false, undefined, {
+    completeResponses: async request => { requests.push(structuredClone(request)); return responses.shift(); }
+  });
+  assert.equal(await agent.run('Inspect'), 'Recovered.');
+  assert.deepEqual(requests[1].input.at(-1), {
+    type: 'function_call_output',
+    call_id: 'tool-1-1',
+    output: JSON.stringify({ ok: false, error: '"undefined" is not valid JSON' })
+  });
+});
+
 const responseReply = text => ({
   output: [{ type: 'message', id: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] }],
   output_text: text
