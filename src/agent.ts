@@ -392,7 +392,9 @@ export class CodingAgent {
       const calls = response.output.filter((item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call");
       await this.emit({ type: "response", step: step + 1, toolCalls: calls.length });
       if (!calls.length) {
-        const result = response.output_text || "(empty response)";
+        const result = typeof response.output_text === "string" && response.output_text.trim()
+          ? response.output_text
+          : "(empty response)";
         await this.emit({ type: "final", step: step + 1, content: result });
         return result;
       }
