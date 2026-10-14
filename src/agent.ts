@@ -158,6 +158,21 @@ function responseSummaryMessages(items: OpenAI.Responses.ResponseInput): OpenAI.
   });
 }
 
+function validateResponsesResponse(response: unknown): string | undefined {
+  if (!response || typeof response !== "object") return "Provider returned an invalid Responses response.";
+  const output = (response as { output?: unknown }).output;
+  if (!Array.isArray(output)) return "Provider returned an invalid Responses response.";
+  if ("output_text" in response && typeof (response as { output_text?: unknown }).output_text !== "string") {
+    return "Provider returned an invalid Responses output_text value.";
+  }
+  for (const item of output) {
+    if (!item || typeof item !== "object" || typeof (item as { type?: unknown }).type !== "string") {
+      return "Provider returned an invalid Responses output item.";
+    }
+  }
+  return undefined;
+}
+
 class ResponsesConversationContext {
   private items: OpenAI.Responses.ResponseInput = [];
   private readonly maxMessages: number;
@@ -366,8 +381,9 @@ export class CodingAgent {
         await this.emit({ type: "error", step: step + 1, error: message });
         throw error;
       }
-      if (!response || !Array.isArray(response.output)) {
-        const error = new Error("Provider returned an invalid Responses response.");
+      const responseError = validateResponsesResponse(response);
+      if (responseError) {
+        const error = new Error(responseError);
         await this.emit({ type: "error", step: step + 1, error: error.message });
         throw error;
       }
