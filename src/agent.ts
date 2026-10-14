@@ -388,8 +388,20 @@ export class CodingAgent {
         throw error;
       }
       // Reasoning and assistant output items must be preserved before tool outputs.
-      this.responseContext.add(...(response.output as OpenAI.Responses.ResponseInputItem[]));
-      const calls = response.output.filter((item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call");
+      // Normalize incomplete function calls before replaying them to the API. This
+      // keeps the next request structurally valid while `null` arguments still
+      // produce a visible structured tool error instead of executing a guessed call.
+      const outputItems = response.output.map((item, itemIndex) => {
+        if (item.type !== "function_call") return item;
+        const call = item as OpenAI.Responses.ResponseFunctionToolCall;
+        return {
+          ...call,
+          call_id: typeof call.call_id === "string" && call.call_id ? call.call_id : `tool-${step + 1}-${itemIndex + 1}`,
+          arguments: typeof call.arguments === "string" ? call.arguments : "null"
+        };
+      }) as OpenAI.Responses.ResponseInputItem[];
+      this.responseContext.add(...outputItems);
+      const calls = outputItems.filter((item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call");
       await this.emit({ type: "response", step: step + 1, toolCalls: calls.length });
       if (!calls.length) {
         const result = typeof response.output_text === "string" && response.output_text.trim()
