@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { z } from "zod";
 import { FilePatch, WorkspaceTools, ToolResult } from "./tools.js";
+import { formatConfirmationJson } from "./output.js";
 
 export type ChatCompletionRequest = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
 export type ChatCompletionResponse = Pick<OpenAI.Chat.Completions.ChatCompletion, "choices">;
@@ -333,23 +334,36 @@ export class CodingAgent {
         await this.emit({ type: "final", step: step + 1, content: result });
         return result;
       }
-      this.context.add(message);
       const calls = message.tool_calls ?? [];
-      await this.emit({ type: "response", step: step + 1, toolCalls: calls.length });
-      if (!calls.length) {
+      const normalizedCalls = calls.map((call, callIndex) => ({
+        ...call,
+        id: typeof call?.id === "string" && call.id ? call.id : `tool-${step + 1}-${callIndex + 1}`,
+        function: {
+          ...call?.function,
+          name: typeof call?.function?.name === "string" && call.function.name ? call.function.name : "(unknown)",
+          arguments: typeof call?.function?.arguments === "string" ? call.function.arguments : "null"
+        }
+      }));
+      const normalizedMessage = normalizedCalls.length ? {
+        ...message,
+        tool_calls: normalizedCalls
+      } : message;
+      this.context.add(normalizedMessage);
+      await this.emit({ type: "response", step: step + 1, toolCalls: normalizedCalls.length });
+      if (!normalizedCalls.length) {
         const result = typeof message.content === "string" && message.content.trim()
           ? message.content
           : "(empty response)";
         await this.emit({ type: "final", step: step + 1, content: result });
         return result;
       }
-      for (const [callIndex, call] of calls.entries()) {
-        const callId = typeof call?.id === "string" && call.id ? call.id : `tool-${step + 1}-${callIndex + 1}`;
-        const callName = typeof call?.function?.name === "string" && call.function.name ? call.function.name : "(unknown)";
+      for (const call of normalizedCalls) {
+        const callId = call.id;
+        const callName = call.function.name;
         await this.emit({ type: "tool_start", step: step + 1, id: callId, name: callName });
         let result: ToolResult;
         try {
-          const args: unknown = JSON.parse(call?.function?.arguments ?? "");
+          const args: unknown = JSON.parse(call.function.arguments);
           result = await this.execute(callName, args);
         } catch (error) {
           result = { ok: false, error: this.errorMessage(error) };
@@ -374,7 +388,8 @@ export class CodingAgent {
           model: this.model,
           instructions: SYSTEM_PROMPT,
           input: await this.responseContext.getMessages(),
-          tools: responseToolDefinitions
+          tools: responseToolDefinitions,
+          store: false
         });
       } catch (error) {
         const message = this.errorMessage(error);
@@ -397,6 +412,7 @@ export class CodingAgent {
         return {
           ...call,
           call_id: typeof call.call_id === "string" && call.call_id ? call.call_id : `tool-${step + 1}-${itemIndex + 1}`,
+          name: typeof call.name === "string" && call.name ? call.name : "(unknown)",
           arguments: typeof call.arguments === "string" ? call.arguments : "null"
         };
       }) as OpenAI.Responses.ResponseInputItem[];
@@ -441,12 +457,12 @@ export class CodingAgent {
       case "read_file": return this.tools.readFile(schemas.read_file.parse(raw).path);
       case "write_file": {
         const args = schemas.write_file.parse(raw);
-        if (!await this.confirm(`Write/replace ${JSON.stringify(args.path)} with this content?\n${JSON.stringify(args.content)}`)) return { ok: false, error: "User declined file write" };
+        if (!await this.confirm(`Write/replace ${formatConfirmationJson(args.path)} with this content?\n${formatConfirmationJson(args.content)}`)) return { ok: false, error: "User declined file write" };
         return this.tools.writeFile(args.path, args.content);
       }
       case "apply_patch": {
         const args = schemas.apply_patch.parse(raw) as { path: string; patches: FilePatch[] };
-        if (!await this.confirm(`Apply exact text patches to ${JSON.stringify(args.path)}?\n${JSON.stringify(args.patches)}`)) return { ok: false, error: "User declined file patch" };
+        if (!await this.confirm(`Apply exact text patches to ${formatConfirmationJson(args.path)}?\n${formatConfirmationJson(args.patches)}`)) return { ok: false, error: "User declined file patch" };
         return this.tools.applyPatch(args.path, args.patches);
       }
       case "run_command": {
