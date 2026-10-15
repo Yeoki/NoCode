@@ -5,6 +5,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { AgentEvent, CodingAgent } from "./agent.js";
 import { WorkspaceTools } from "./tools.js";
+import { formatAssistantOutput } from "./output.js";
 
 /**
  * Render lifecycle events without printing model reasoning.  stderr is used
@@ -104,7 +105,7 @@ async function main(): Promise<void> {
       const input = line.trim();
       if (!input) continue;
       if (input === "/exit" || input === "/quit") break;
-      try { console.log(`\n${await agent.run(input)}`); }
+      try { console.log(`\n${formatAssistantOutput(await agent.run(input))}`); }
       catch (error) { console.error(error instanceof Error ? error.message : String(error)); }
     }
   } finally { rl.close(); }
