@@ -56,11 +56,26 @@ test('Responses API loop sends function_call_output and preserves tool history',
   assert.deepEqual(invocations, [['.']]);
   assert.equal(requests[0].tools[0].type, 'function');
   assert.equal(requests[0].tools[0].name, 'list_files');
+  assert.equal(requests[0].store, false);
   assert.deepEqual(requests[1].input.at(-1), {
     type: 'function_call_output',
     call_id: 'call-1',
     output: JSON.stringify({ ok: true, output: 'tool output' })
   });
+});
+
+test('Chat API normalizes incomplete tool calls before replaying them', async () => {
+  const s = setup([
+    reply(null, [{ type: 'function', function: { name: 'list_files' } }]),
+    reply('Recovered.')
+  ]);
+  assert.equal(await s.agent.run('Inspect'), 'Recovered.');
+  assert.deepEqual(s.requests[1].messages.find(message => message.role === 'assistant').tool_calls, [{
+    type: 'function',
+    id: 'tool-1-1',
+    function: { name: 'list_files', arguments: 'null' }
+  }]);
+  assert.match(JSON.parse(s.requests[1].messages.find(message => message.role === 'tool').content).error, /Expected object, received null/);
 });
 
 test('Responses API surfaces malformed provider output through the error event', async () => {
@@ -94,6 +109,21 @@ test('Responses API converts incomplete function calls into structured tool erro
     call_id: 'tool-1-1',
     output: JSON.stringify({ ok: false, error: 'Invalid arguments for list_files: [\n  {\n    "code": "invalid_type",\n    "expected": "object",\n    "received": "null",\n    "path": [],\n    "message": "Expected object, received null"\n  }\n]' })
   });
+});
+
+test('Responses API normalizes missing function names before replaying them', async () => {
+  const requests = [];
+  const tools = { listFiles: async () => ({ ok: true, output: '' }) };
+  const responses = [
+    { output: [{ type: 'function_call', id: 'fc-1', call_id: 'call-1', arguments: '{}' }], output_text: '' },
+    { output: [], output_text: 'Recovered.' }
+  ];
+  const agent = new CodingAgent(tools, async () => false, undefined, {
+    completeResponses: async request => { requests.push(structuredClone(request)); return responses.shift(); }
+  });
+  assert.equal(await agent.run('Inspect'), 'Recovered.');
+  assert.equal(requests[1].input[1].name, '(unknown)');
+  assert.match(JSON.parse(requests[1].input[2].output).error, /Unknown tool: \(unknown\)/);
 });
 
 test('Responses API makes blank provider content visible instead of looking like no response', async () => {
