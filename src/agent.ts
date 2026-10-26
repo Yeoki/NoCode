@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { FilePatch, WorkspaceTools, ToolResult } from "./tools.js";
 import { formatConfirmationJson } from "./output.js";
+import { JsonSessionStore, SessionSnapshot } from "./session.js";
 
 export type ChatCompletionRequest = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
 export type ChatCompletionResponse = Pick<OpenAI.Chat.Completions.ChatCompletion, "choices">;
@@ -104,6 +105,9 @@ export class ConversationContext {
     this.messages.push(message);
   }
 
+  restore(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void { this.messages = messages.slice(); }
+  snapshot(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] { return this.messages.slice(); }
+
   get length(): number {
     return this.messages.length;
   }
@@ -189,6 +193,9 @@ class ResponsesConversationContext {
     this.items.push(...items);
   }
 
+  restore(items: OpenAI.Responses.ResponseInput): void { this.items = items.slice(); }
+  snapshot(): OpenAI.Responses.ResponseInput { return this.items.slice(); }
+
   async getMessages(): Promise<OpenAI.Responses.ResponseInput> {
     // The separate instructions field counts as one message, like the Chat system prompt.
     const available = this.maxMessages - 1;
@@ -224,6 +231,8 @@ export interface CodingAgentOptions extends ContextOptions {
   onProgress?: AgentEventHandler;
   /** Optional Responses API provider, also accepted directly as the fourth constructor argument. */
   completeResponses?: ResponsesProvider;
+  sessionPath?: string;
+  sessionId?: string;
 }
 
 const schemas = {
@@ -266,6 +275,9 @@ export class CodingAgent {
   private readonly responseContext: ResponsesConversationContext;
   private readonly useResponses: boolean;
   private readonly onEvent?: AgentEventHandler;
+  private readonly sessionStore?: JsonSessionStore;
+  private readonly sessionId: string;
+  private readonly ready: Promise<void>;
 
   constructor(
     private readonly tools: WorkspaceTools,
@@ -293,6 +305,29 @@ export class CodingAgent {
     this.context = new ConversationContext(SYSTEM_PROMPT, contextOptions);
     this.responseContext = new ResponsesConversationContext(contextOptions);
     this.onEvent = options.onEvent ?? options.onProgress;
+    this.sessionId = options.sessionId ?? "default";
+    this.sessionStore = options.sessionPath ? new JsonSessionStore(options.sessionPath) : undefined;
+    this.ready = this.restoreSession();
+  }
+
+  private async restoreSession(): Promise<void> {
+    if (!this.sessionStore) return;
+    const snapshot = await this.sessionStore.load(this.sessionId);
+    if (!snapshot) return;
+    if (snapshot.wireApi === "chat" && snapshot.chatMessages) this.context.restore(snapshot.chatMessages);
+    if (snapshot.wireApi === "responses" && snapshot.responseItems) this.responseContext.restore(snapshot.responseItems);
+  }
+
+  private async persistSession(wireApi: "chat" | "responses"): Promise<void> {
+    if (!this.sessionStore) return;
+    const snapshot: SessionSnapshot = {
+      version: 1,
+      sessionId: this.sessionId,
+      updatedAt: new Date().toISOString(),
+      wireApi,
+      ...(wireApi === "chat" ? { chatMessages: this.context.snapshot() } : { responseItems: this.responseContext.snapshot() })
+    };
+    await this.sessionStore.save(snapshot);
   }
 
   /** Event handlers are advisory. A broken status renderer must never stop the agent. */
@@ -306,6 +341,7 @@ export class CodingAgent {
   }
 
   async run(userInput: string): Promise<string> {
+    await this.ready;
     if (this.useResponses) return this.runResponses(userInput);
     return this.runChat(userInput);
   }
@@ -332,6 +368,7 @@ export class CodingAgent {
         const result = "No response from model.";
         await this.emit({ type: "response", step: step + 1, toolCalls: 0 });
         await this.emit({ type: "final", step: step + 1, content: result });
+        await this.persistSession("chat");
         return result;
       }
       const calls = message.tool_calls ?? [];
@@ -355,6 +392,7 @@ export class CodingAgent {
           ? message.content
           : "(empty response)";
         await this.emit({ type: "final", step: step + 1, content: result });
+        await this.persistSession("chat");
         return result;
       }
       for (const call of normalizedCalls) {
@@ -375,6 +413,7 @@ export class CodingAgent {
     const result = "Stopped after the maximum tool steps.";
     await this.emit({ type: "stopped", step: 8, reason: "maximum tool steps", content: result });
     await this.emit({ type: "final", step: 8, content: result });
+    await this.persistSession("chat");
     return result;
   }
 
@@ -424,6 +463,7 @@ export class CodingAgent {
           ? response.output_text
           : "(empty response)";
         await this.emit({ type: "final", step: step + 1, content: result });
+        await this.persistSession("responses");
         return result;
       }
       for (const [callIndex, call] of calls.entries()) {
@@ -444,6 +484,7 @@ export class CodingAgent {
     const result = "Stopped after the maximum tool steps.";
     await this.emit({ type: "stopped", step: 8, reason: "maximum tool steps", content: result });
     await this.emit({ type: "final", step: 8, content: result });
+    await this.persistSession("responses");
     return result;
   }
 

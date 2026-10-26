@@ -9,6 +9,7 @@ NoCode is a small, extensible TypeScript coding-agent CLI inspired by Codex, Cla
 - Injectable completion providers for offline tests and alternate backends
 - Safe workspace-scoped file tools
 - Bounded conversation context with an optional summarization hook
+- Workspace-local session memory that resumes conversation history across restarts
 - Deterministic, confirmation-gated text patches for focused edits
 - Explicit confirmation before shell commands
 - Simple agent loop with tool-call handling
@@ -41,6 +42,14 @@ safe lifecycle updates such as `thinking`, `tool_start`, `tool_result`,
 never expose hidden model reasoning. The CLI renders a spinner while waiting
 for a provider and writes tool summaries to stderr so the final answer on
 stdout remains pipe-friendly.
+
+Session memory is enabled by the CLI by default. It stores the wire-native
+conversation in `.nocode/session.json` under the selected workspace and restores
+it when the same session starts again. Set `NOCODE_SESSION_ID` to keep multiple
+independent sessions, or `NOCODE_SESSION_PATH` to choose another file. Library
+users can pass `sessionPath` and `sessionId` in `CodingAgent` options. Persistence
+is atomic and versioned; malformed snapshots are ignored, and persistence is
+disabled when `sessionPath` is not supplied.
 
 When Codex is logged in with an API key on the same computer, the local bridge can reuse that key without copying it into this repository:
 

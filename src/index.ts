@@ -95,7 +95,11 @@ async function main(): Promise<void> {
     // Piped input is never accepted as authorization for mutations or commands.
     if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
     return (await ask(`${prompt} [y/N] `))?.trim().toLowerCase() === "y";
-  }, undefined, { onEvent: createProgressRenderer() });
+  }, undefined, {
+    onEvent: createProgressRenderer(),
+    sessionPath: process.env.NOCODE_SESSION_PATH ?? path.join(workspace, ".nocode", "session.json"),
+    sessionId: process.env.NOCODE_SESSION_ID ?? "default"
+  });
   console.log(`NoCode workspace: ${workspace}`);
   console.log("Type /exit to quit. Approved commands are not sandboxed.");
   try {

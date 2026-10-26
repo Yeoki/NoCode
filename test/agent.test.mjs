@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CodingAgent } from '../dist/agent.js';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 const call = (name, args, id = 'call-1') => ({ id, type: 'function', function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
 const reply = (content, tool_calls) => ({ choices: [{ index: 0, finish_reason: tool_calls ? 'tool_calls' : 'stop', logprobs: null, message: { role: 'assistant', content, ...(tool_calls ? { tool_calls } : {}), refusal: null } }] });
@@ -30,6 +33,28 @@ test('mocked loop sends tool results and retains conversation across turns', asy
   assert.equal(await s.agent.run('Next'), 'Next answer.');
   assert.equal(s.requests[2].messages.at(-2).content, 'Listed.');
   assert.deepEqual(s.prompts, []);
+});
+
+test('session persistence restores chat history in a new agent', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'nocode-session-'));
+  const sessionPath = path.join(dir, 'session.json');
+  try {
+    const first = new CodingAgent({}, async () => false, async request => reply('First answer.'), { sessionPath, sessionId: 'demo' });
+    assert.equal(await first.run('Remember this'), 'First answer.');
+    const persisted = JSON.parse(await readFile(sessionPath, 'utf8'));
+    assert.equal(persisted.version, 1);
+    assert.equal(persisted.sessionId, 'demo');
+    const requests = [];
+    const second = new CodingAgent({}, async () => false, async request => {
+      requests.push(request);
+      return reply('Second answer.');
+    }, { sessionPath, sessionId: 'demo' });
+    assert.equal(await second.run('Continue'), 'Second answer.');
+    assert.equal(requests[0].messages.at(-2).content, 'First answer.');
+    assert.equal(requests[0].messages.at(-1).content, 'Continue');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('Responses API loop sends function_call_output and preserves tool history', async () => {
