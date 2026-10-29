@@ -60,6 +60,17 @@ export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 const DEFAULT_MAX_MESSAGES = 40;
 const SUMMARY_PREFIX = "Previous conversation summary:\n";
 
+function summaryMessage(summary: string): { role: "system"; content: string } {
+  return { role: "system", content: `${SUMMARY_PREFIX}${summary}` };
+}
+
+/** Only the reserved leading system-summary slot is restored as compaction state. */
+function restoredSummary(message: unknown): string | undefined {
+  if (!message || typeof message !== "object" || !("role" in message) || message.role !== "system") return undefined;
+  if (!("content" in message) || typeof message.content !== "string" || !message.content.startsWith(SUMMARY_PREFIX)) return undefined;
+  return message.content.slice(SUMMARY_PREFIX.length).trim() || undefined;
+}
+
 /** Find the beginning of as many complete user turns as fit in a message budget. */
 function startForTurnBudget<T>(body: T[], budget: number, isUser: (message: T) => boolean): number {
   if (budget <= 0) return body.length;
@@ -90,6 +101,7 @@ function startForTurnBudget<T>(body: T[], budget: number, isUser: (message: T) =
  */
 export class ConversationContext {
   private messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  private summary?: string;
   private readonly maxMessages: number;
   private readonly summarize?: ContextSummarizer;
 
@@ -105,48 +117,65 @@ export class ConversationContext {
     this.messages.push(message);
   }
 
-  restore(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void { this.messages = messages.slice(); }
-  snapshot(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] { return this.messages.slice(); }
+  restore(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void {
+    const systemLength = messages[0]?.role === "system" ? 1 : 0;
+    this.summary = restoredSummary(messages[systemLength]);
+    this.messages = this.summary ? [...messages.slice(0, systemLength), ...messages.slice(systemLength + 1)] : messages.slice();
+  }
+
+  /** Keep the v1 wire-native snapshot format, including summaries hidden by a tiny request budget. */
+  snapshot(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+    return this.withSummary(Boolean(this.summary));
+  }
+
+  private withSummary(includeSummary: boolean): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+    const systemLength = this.messages[0]?.role === "system" ? 1 : 0;
+    return [
+      ...this.messages.slice(0, systemLength),
+      ...(includeSummary && this.summary ? [summaryMessage(this.summary)] : []),
+      ...this.messages.slice(systemLength)
+    ];
+  }
 
   get length(): number {
-    return this.messages.length;
+    return this.messages.length + (this.summary ? 1 : 0);
   }
 
   /** Return a bounded snapshot suitable for a chat-completion request. */
   async getMessages(): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
     await this.compact();
-    return this.messages.slice();
+    return this.withSummary(this.messages.length < this.maxMessages);
   }
 
   private async compact(): Promise<void> {
-    if (this.messages.length <= this.maxMessages) return;
-
     const system = this.messages[0]?.role === "system" ? [this.messages[0]] : [];
     const body = this.messages.slice(system.length);
     const available = Math.max(0, this.maxMessages - system.length);
+    const previousSummary = this.summary;
+    if (body.length + (previousSummary && available >= 2 ? 1 : 0) <= available) return;
     // Reserve one slot for a summary only when at least one user message can remain.
-    const summarySlot = this.summarize && available >= 2 ? 1 : 0;
+    const summarySlot = (previousSummary || this.summarize) && available >= 2 ? 1 : 0;
     let cutAt = startForTurnBudget(body, available - summarySlot, message => message.role === "user");
-    let removed = body.slice(0, cutAt);
-    let summary = "";
+    const removed = body.slice(0, cutAt);
     if (this.summarize && summarySlot && removed.length > 0) {
-      try { summary = (await this.summarize(removed)).trim(); }
-      catch { summary = ""; }
+      try {
+        const summary = (await this.summarize([...(previousSummary ? [summaryMessage(previousSummary)] : []), ...removed])).trim();
+        if (summary) this.summary = summary;
+      } catch { /* A failed hook must not erase the last successful summary. */ }
     }
-    const summaryMessage = summary ? [{ role: "system" as const, content: `${SUMMARY_PREFIX}${summary}` }] : [];
-    if (!summaryMessage.length) {
+    const keptSummarySlot = this.summary && available >= 2 ? 1 : 0;
+    if (!keptSummarySlot) {
       // If summarization was unavailable, retain one more complete turn.
       cutAt = startForTurnBudget(body, available, message => message.role === "user");
-      removed = body.slice(0, cutAt);
     }
-    const keepBudget = Math.max(0, this.maxMessages - system.length - summaryMessage.length);
+    const keepBudget = Math.max(0, available - keptSummarySlot);
     const nextUser = body.slice(cutAt + 1).findIndex((message) => message.role === "user");
     const turnEnd = nextUser < 0 ? body.length : cutAt + 1 + nextUser;
     const turnLength = Math.max(0, turnEnd - cutAt);
     // If the current turn itself is oversized, retaining only its user request is
     // safer than sending an assistant tool call without all of its tool results.
     const kept = turnLength > keepBudget ? body.slice(cutAt, cutAt + Math.min(1, keepBudget)) : body.slice(cutAt, cutAt + keepBudget);
-    this.messages = [...system, ...summaryMessage, ...kept];
+    this.messages = [...system, ...kept];
   }
 }
 
@@ -180,6 +209,7 @@ function validateResponsesResponse(response: unknown): string | undefined {
 
 class ResponsesConversationContext {
   private items: OpenAI.Responses.ResponseInput = [];
+  private summary?: string;
   private readonly maxMessages: number;
   private readonly summarize?: ContextSummarizer;
 
@@ -193,29 +223,39 @@ class ResponsesConversationContext {
     this.items.push(...items);
   }
 
-  restore(items: OpenAI.Responses.ResponseInput): void { this.items = items.slice(); }
-  snapshot(): OpenAI.Responses.ResponseInput { return this.items.slice(); }
+  restore(items: OpenAI.Responses.ResponseInput): void {
+    this.summary = restoredSummary(items[0]);
+    this.items = items.slice(this.summary ? 1 : 0);
+  }
+
+  snapshot(): OpenAI.Responses.ResponseInput {
+    return [...(this.summary ? [summaryMessage(this.summary)] : []), ...this.items];
+  }
 
   async getMessages(): Promise<OpenAI.Responses.ResponseInput> {
     // The separate instructions field counts as one message, like the Chat system prompt.
     const available = this.maxMessages - 1;
-    if (this.items.length > available) {
+    if (this.items.length + (this.summary ? 1 : 0) > available) {
       const isUser = (item: OpenAI.Responses.ResponseInputItem): boolean => "role" in item && item.role === "user";
       let latestUser = this.items.length - 1;
       while (latestUser > 0 && !isUser(this.items[latestUser]!)) latestUser -= 1;
-      const summarySlot = this.summarize && this.items.length - latestUser < available ? 1 : 0;
+      const summarySlot = (this.summary || this.summarize) && this.items.length - latestUser < available ? 1 : 0;
       let cutAt = startForTurnBudget(this.items, available - summarySlot, isUser);
-      let summary = "";
       if (this.summarize && summarySlot && cutAt > 0) {
-        try { summary = (await this.summarize(responseSummaryMessages(this.items.slice(0, cutAt)))).trim(); }
-        catch { summary = ""; }
+        try {
+          const summary = (await this.summarize([
+            ...(this.summary ? [summaryMessage(this.summary)] : []),
+            ...responseSummaryMessages(this.items.slice(0, cutAt))
+          ])).trim();
+          if (summary) this.summary = summary;
+        } catch { /* Keep the last successful summary if the hook is unavailable. */ }
       }
-      if (!summary) cutAt = startForTurnBudget(this.items, available, isUser);
-      const summaryMessage = summary ? [{ role: "system" as const, content: `${SUMMARY_PREFIX}${summary}` }] : [];
+      if (!this.summary || !summarySlot) cutAt = startForTurnBudget(this.items, available, isUser);
       // Keep the entire current turn even if oversized: reasoning, calls and outputs must stay together.
-      this.items = [...summaryMessage, ...this.items.slice(cutAt)];
+      this.items = this.items.slice(cutAt);
     }
-    return this.items.slice();
+    // An oversized current turn can temporarily hide, but never erase, the summary.
+    return [...(this.summary && this.items.length < available ? [summaryMessage(this.summary)] : []), ...this.items];
   }
 }
 

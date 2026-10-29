@@ -51,6 +51,25 @@ users can pass `sessionPath` and `sessionId` in `CodingAgent` options. Persisten
 is atomic and versioned; malformed snapshots are ignored, and persistence is
 disabled when `sessionPath` is not supplied.
 
+For both Chat and Responses, the latest successful compacted summary is retained
+separately from recent turns in memory and saved in the existing v1 snapshot's
+leading `Previous conversation summary:` system-message slot. Existing v1 files
+with or without a summary remain compatible. On later compaction, the hook receives
+that summary once alongside newly removed history. If the hook is absent, returns
+blank text, or throws, the prior summary is kept instead of silently discarded.
+When a tiny budget or an oversized Responses tool turn leaves no room, the summary
+is omitted from that request but remains in the snapshot and returns when it fits.
+
+Summaries are created only by the optional `summarizeHistory` hook; the CLI does not
+generate them automatically. Preserving an older summary does not summarize newly
+evicted messages when the hook is unavailable. Snapshots are written when a run
+completes (including the tool-step limit), not after each provider or tool call;
+an interrupted or failed run may leave the previous completed snapshot on disk.
+
+Run `npm test` for the TypeScript build and offline regression suite. Session tests
+cover both APIs, hook failures, small budgets, tool-turn integrity, and recovery
+between separate Node.js processes without API credentials.
+
 When Codex is logged in with an API key on the same computer, the local bridge can reuse that key without copying it into this repository:
 
 ```bash
